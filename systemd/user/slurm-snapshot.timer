@@ -1,0 +1,19 @@
+# slurm-snapshot.timer (user unit): fire slurm-snapshot.service every 15 minutes, on the quarter
+# hour, from an ordinary account's `systemctl --user` manager.
+#
+# A snapshot is a point in time, so a cycle missed while the node or the user manager was down
+# is not run late (Persistent=no). systemd does not start the oneshot while the previous cycle
+# still runs, so cycles never overlap; a cycle longer than the interval skips the next tick.
+# The user manager only runs while the account has a session, unless `loginctl enable-linger`
+# has been run for it; without linger, the timer stops at logout.
+[Unit]
+Description=Slurm snapshot bundle every 15 minutes (user account)
+
+[Timer]
+OnCalendar=*:0/15
+AccuracySec=1s
+Persistent=no
+Unit=slurm-snapshot.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,48 @@
+# slurm-snapshot.service (user unit): one snapshot cycle, run by an ordinary account with
+# `systemctl --user`. No root needed. Started by slurm-snapshot.timer in the same directory.
+#
+# Where things live is a parameter, not a fixed path. The three variables below are read from
+#   ~/.config/systemd/user/slurm-snapshot.env       (copy slurm-snapshot.env.example there)
+# and fall back to the Environment= defaults under the home directory when that file is absent.
+# Values in the file are literal: systemd does not expand ~, $HOME or other variables in an
+# EnvironmentFile, so write absolute paths.
+#   SNAPSHOT_SCRIPTS   the copy of the scripts directory (snapshot-bundle.sh and its neighbours)
+#   SNAPSHOT_ROOT      the work root; bundles land in SNAPSHOT_ROOT/YYYY/MM/DD/<cluster>-<stamp>.tgz
+#   SNAPSHOT_SINCE     the sacct window (should overlap the timer interval)
+#
+# Install, as the account that should run it (ROOT is the work root you choose):
+#   cp -r scripts /path/of/your/choice/slurm-snapshot
+#   mkdir -p ROOT ~/.config/systemd/user
+#   cp /path/of/your/choice/slurm-snapshot/systemd/user/slurm-snapshot.* ~/.config/systemd/user/
+#   mv ~/.config/systemd/user/slurm-snapshot.env.example ~/.config/systemd/user/slurm-snapshot.env
+#   $EDITOR ~/.config/systemd/user/slurm-snapshot.env         # set the three paths
+#   systemctl --user daemon-reload && systemctl --user enable --now slurm-snapshot.timer
+#   loginctl enable-linger            # keep the user manager, so the timer, alive after logout
+# Watch: systemctl --user list-timers slurm-snapshot.timer ; journalctl --user -u slurm-snapshot
+#        systemctl --user show -p Environment slurm-snapshot.service    # the values in effect
+#
+# There is no User= line: a user unit always runs as its owner. The sandboxing lines of the
+# system unit (ProtectSystem=, PrivateTmp=) are left out: they need namespaces an unprivileged
+# user manager may not be allowed to create, and the account's own permissions already bound
+# what the scripts can touch.
+[Unit]
+Description=Slurm snapshot bundle: one cycle of the *-snapshot.sh scripts (user account)
+
+[Service]
+Type=oneshot
+# Defaults, used only when the env file below is missing. %h is the home directory.
+Environment=SNAPSHOT_SCRIPTS=%h/slurm-snapshot
+Environment=SNAPSHOT_ROOT=%h/slurm-snapshot-data
+Environment=SNAPSHOT_SINCE=now-2hours
+# The parameters. The leading "-" makes a missing file a non-error; a present file wins over the
+# defaults above.
+EnvironmentFile=-%h/.config/systemd/user/slurm-snapshot.env
+# systemd expands ${VAR} in the arguments but never in the executable itself, which must be a
+# literal absolute path. /usr/bin/env is that literal: it execs its first argument, the driver.
+ExecStart=/usr/bin/env ${SNAPSHOT_SCRIPTS}/snapshot-bundle.sh ${SNAPSHOT_ROOT} ${SNAPSHOT_SINCE}
+# A cycle is bounded here, not by timeout(1) inside the scripts. With a broken Slurm
+# configuration scontrol retries for up to 60 s per call, so allow well over 2 minutes; keep it
+# under the timer interval. Tune against the seconds column of the bundle's manifest.txt.
+TimeoutStartSec=14min
+Nice=10
+IOSchedulingClass=idle
