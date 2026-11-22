@@ -1,145 +1,504 @@
-# script-form/
+# slurmsnap-capture
 
-Every `*.sh` file here passes `shellcheck`. The rules for working here are in `AGENTS.md`.
+Bash scripts that take snapshots of a Slurm cluster and pack them into dated bundles.
 
-| File | What it is |
-|---|---|
-| `squeue-snapshot.sh` | `scripts/squeue-snapshot.sh OUT_DIR`: one squeue snapshot, gzipped into a dated file. Four stages: discover the fields from `squeue --helpFormat`, build a `--Format` from them, run squeue once, write the file (a few `# key: value` lines, a header row, one record per job; TAB+0x1f between fields, 0x1e ending each record). Nothing about fields is hardcoded: downstream reads the header. Uses `snapshot-lib.sh`; needs bash, squeue, scontrol, gzip. Meant for a systemd timer. |
-| `scontrol-snapshot.sh` | `scripts/scontrol-snapshot.sh OUT_DIR node\|partition\|reservation\|config\|job`: one `scontrol show` snapshot, gzipped into `OUT_DIR/scontrol-<OBJECT>-<UTC time>.txt.gz`. The `# key: value` lines are followed by scontrol's stdout unchanged. node, partition, reservation and config are text in the default multi-line layout (not `--oneliner`, so free-text values such as `OS=` and `Reason=` keep their own lines); job is one line of JSON (`--json`, `SLURM_JSON=compact`). Times are epoch (`SLURM_TIME_FORMAT=%s`); `--all` includes hidden partitions. Exits with scontrol's status, or 2 for a usage error. Design: `snapshot-plans/C03-scontrol-show-node.md`. |
-| `sacctmgr-snapshot.sh` | `scripts/sacctmgr-snapshot.sh OUT_DIR assoc\|qos`: one sacctmgr snapshot as one line of JSON (`--json`, `SLURM_JSON=compact`; sacctmgr has no field list and no delimiter, and JSON names every field). assoc is scoped to `cluster=<ClusterName>` (regex-checked, never unscoped; exit 1 without a valid name); qos covers every QOS. Exits with sacctmgr's status, or 2 for a usage error. Design: `snapshot-plans/C12-sacctmgr-assoc.md`, `C13-sacctmgr-qos.md`. |
-| `sprio-snapshot.sh` | `scripts/sprio-snapshot.sh OUT_DIR`: the priority factors of every eligible pending job, once per partition, in one call. Every letter from `sprio --helpformat` is used, normalized (lowercase) and weighted (uppercase) side by side. The header row holds the specifiers (`%A`, `%a`, …), matched case-sensitively, and `# names:` gives sprio's titles. No `-w` call: `sprio --weights` segfaults on `%c` (26.05.5), and the weights are in the config snapshot. If sprio is killed by a signal, each letter is probed and the bad ones blanked (`# blanked:`). Records layout as squeue. Design: `snapshot-plans/C14-C16-sprio.md`. |
-| `sacct-snapshot.sh` | `scripts/sacct-snapshot.sh OUT_DIR [SINCE]`: every job, array task and step active from SINCE to now (default `now-2hours`; short forms such as `now-1d`, `now-24h` and `now-90m` are rewritten into the whole-word units sacct requires, and anything unrecognised exits 2), all users, this cluster, every field from `sacct --helpformat`, `--noconvert`, epoch times. Fields are split by `--delimiter=$'\t\x1f'`, and the script adds the 0x1e record terminator once a record holds every separator, so values with newlines stay in their record (an empty line inside a value counts no separators; fixed 2026-11-13 after the orcd bundle showed 12 records swallowing the next). Exits with sacct's status, 3 if the output ends inside a record, or 2 for a usage error. Replaces the per-array sacct calls and seff (`snapshot-plans/C11-sacct-array-tasks.md`, `C17-seff.md`). |
-| `sshare-snapshot.sh` | `scripts/sshare-snapshot.sh OUT_DIR`: fair-share shares and usage for every account and user (`sshare --all`), every field from `sshare --helpformat`. It uses `--delimiter` when `sshare --help` offers it; otherwise it translates `--parsable2`'s `\|`, after checking every line's field count. A mismatch writes nothing and exits 3. Account indentation (tree depth) is kept. Records layout as squeue. Design: `snapshot-plans/sshare-fairshare.md`. |
-| `snapshot-bundle.sh` | `scripts/snapshot-bundle.sh ROOT_DIR [SINCE]`: one snapshot cycle for a systemd timer. Runs the eleven snapshot calls of `command-list`, in that order, into `ROOT_DIR/YYYY/MM/DD/<cluster>-<UTC time>/` (UTC, from one clock reading; `snap-` when there is no valid cluster name), writes a `manifest.txt` (the `# key: value` lines, then step, exit status, seconds and file per step), then tars and gzips the directory to `<cluster>-<UTC time>.tgz` next to it (written as `.tmp` and renamed) and removes the directory. A failing step does not stop the cycle. SINCE goes to `sacct-snapshot.sh` (default `now-2hours`). Exits 0 when all is well, 1 when the tarball was written but a step failed, 3 when tar failed (the directory is kept), 2 for a usage error. Design: `snapshot-plans/bundle-driver.md`. |
-| `systemd/` | Two pairs of `slurm-snapshot.service` (oneshot running `snapshot-bundle.sh`, `TimeoutStartSec=14min`) and `slurm-snapshot.timer` (`OnCalendar=*:0/15`, `Persistent=no`). `system/`: installed by root under `/etc/systemd/system/`, runs as a dedicated `User=`, sandboxed. `user/`: installed by an ordinary account under `~/.config/systemd/user/`, no root; the scripts path, work root and sacct window come from `slurm-snapshot.env` next to the units (`slurm-snapshot.env.example` is the template), with `%h` defaults when the file is absent. See "Running under systemd" below. |
-| `snapshot-lib.sh` | Sourced by the snapshot scripts, never run. Shared functions: `show_command` (prints a command as wrapped, pasteable `# command:` header lines); `snapshot_stamp` (the UTC time, read once per run); `cluster_name` (ClusterName from `scontrol show config`, or nothing); `join_fields` (joins names into a `--format` or header row); `write_snapshot` (the common header lines plus the body, gzipped to `.tmp` and renamed, path printed). Sets no shell options and touches no variables of the caller. |
-| `AGENTS.md` | Instructions for anyone working here: scope (snapshot gathering only; parsing, analysis and presentation are other projects), the file contract, design rules, known traps, and how to test against the Docker cluster. `CLAUDE.md` points to it. |
-| `snapshot-plans/` | Design notes: one markdown file per command step, describing its snapshot script. Start at `snapshot-plans/README.md`. |
+## 1. What this repository is
 
-## How to run the checks
+This repository holds bash scripts that take snapshots of the current state of a Slurm cluster.
+Each script does one bulk, read-only Slurm query and writes one gzipped file. The file describes
+itself: it says what ran, when, where, and how to split it. One run of every script gives one
+snapshot bundle.
 
-```bash
-shellcheck *.sh
+A bundle is the raw material for later work. It holds the data that says which jobs run or wait,
+why they wait, and why their priorities differ. This repository only captures that data. Other
+repositories parse it, load it into a database, and present it. Refer to section 10.
+
+The scripts run on a Slurm login node. They need bash 4.3 or later, the Slurm client commands,
+gzip, and GNU tar. A systemd timer can run them without a person at the keyboard, but systemd is
+optional. The scripts change nothing in Slurm. They use no Slurm command or flag that changes
+state.
+
+## 2. What a snapshot bundle contains
+
+A bundle is one tarball with eleven snapshot files and a manifest. The driver writes it into a
+date hierarchy under a work root that you choose:
+
+```
+ROOT/
+└── 2026/
+    └── 11/
+        └── 21/
+            ├── eofe7-20261121T141500Z.tgz
+            └── eofe7-20261121T143000Z.tgz
 ```
 
-Then run the scripts inside the Docker test cluster, as `AGENTS.md` §7 describes:
+The year, month and day are UTC, the same as the time stamps in the file names. The name before
+the stamp is the cluster name that Slurm reports. The tarball holds one directory with the same
+name:
 
-```bash
-docker cp /path/to/script-form slurmctld:/tmp/snap
-docker exec slurmctld /tmp/snap/sprio-snapshot.sh /tmp/out
-docker cp slurmctld:/tmp/out ./docker-out
-docker exec slurmctld rm -rf /tmp/snap /tmp/out
+```
+eofe7-20261121T141500Z/
+├── manifest.txt
+├── squeue-20261121T141500Z.txt.gz
+├── scontrol-job-20261121T141501Z.txt.gz
+├── sprio-20261121T141503Z.txt.gz
+├── sshare-20261121T141503Z.txt.gz
+├── scontrol-node-20261121T141504Z.txt.gz
+├── scontrol-partition-20261121T141505Z.txt.gz
+├── scontrol-reservation-20261121T141505Z.txt.gz
+├── scontrol-config-20261121T141505Z.txt.gz
+├── sacctmgr-assoc-20261121T141506Z.txt.gz
+├── sacctmgr-qos-20261121T141507Z.txt.gz
+└── sacct-20261121T141508Z.txt.gz
 ```
 
-For a change to how a script processes a body (the sacct awk pass, the sshare translation),
-also replay the real orcd bundle in `../example-output-bundles/` as `AGENTS.md` §7 shows; the
-Docker cluster's few rows never contain the awkward values that a production cluster's do.
+### 2.1 The header of a snapshot file
 
-To test the driver, run it the same way and look inside the result; the only file left under
-`/tmp/out` should be `YYYY/MM/DD/linux-<stamp>.tgz`:
+Every snapshot file starts with the same header lines. The header ends at the `# exit:` line.
+The body comes after it.
 
-```bash
-docker exec slurmctld /tmp/snap/snapshot-bundle.sh /tmp/out
-docker exec slurmctld find /tmp/out -type f
-tar -tzf docker-out/2026/11/21/linux-<stamp>.tgz
-tar -xzOf docker-out/2026/11/21/linux-<stamp>.tgz linux-<stamp>/manifest.txt
+```
+# captured: 2026-11-21T14:15:00Z     one clock reading, also the source of the file name
+# host: login006                     the node that ran the command
+# cluster: eofe7                     the cluster name that scontrol reports
+# slurm: slurm 26.05.4               the version of the command that ran
+# command:                           the command as it ran, environment included
+#   SLURM_TIME_FORMAT=%s squeue --all --array --noheader --states=all --Format=...
+# format: records                    records, text or json
+# times: epoch seconds ...           command-specific lines come here
+# exit: 0                            the exit status of the Slurm command
 ```
 
-## Running under systemd
+A body line can also start with `#`, for example a shell comment in a job's submit line. Thus a
+reader must cut the header at the `# exit:` line, not at the last line that starts with `#`.
 
-Two ways, same driver. Both find the snapshot scripts and `snapshot-lib.sh` next to
-`snapshot-bundle.sh`, so copy the whole directory. In both cases check that `PrivateData` lets
-the account see every job and association.
+### 2.2 The three body kinds
 
-**As a system service (root installs it, a dedicated account runs it):**
+The body kind depends on what the Slurm command offers:
 
-1. Copy this directory to the login node, e.g. `/opt/slurm-snapshot/`.
-2. Create the output root (e.g. `/var/lib/slurm-snapshot`) and a service account that may run the
-   Slurm client commands and write there.
-3. Edit `User=` and the two paths in `ExecStart=` of `systemd/system/slurm-snapshot.service`, copy
-   both units from `systemd/system/` to `/etc/systemd/system/`, then:
+| Kind | Scripts | What the body is |
+|---|---|---|
+| records | squeue, sprio, sacct, sshare | A header row of field names, then one record per object |
+| text | scontrol node, partition, reservation, config | The output of `scontrol show`, unchanged, in its multi-line layout |
+| json | scontrol job, sacctmgr assoc, sacctmgr qos | One line of JSON |
+
+In a records body, the fields of a record are separated by a TAB and the byte 0x1f. Each record
+ends with the byte 0x1e and a newline. These two control bytes never occur in Slurm output.
+Thus a job name or comment that contains a tab, a comma, a pipe or a newline cannot shift a
+column or split a record. A value can contain a newline. A reader must split records at
+0x1e+newline, never at a newline alone.
+
+This command shows the first field of each record in a records file:
+
+```bash
+gzip -dc FILE | sed '1,/^# exit:/d' | tr -d '\n' | tr '\036' '\n' | awk -F $'\t\037' '{print $1}'
+```
+
+Times are epoch seconds wherever Slurm obeys `SLURM_TIME_FORMAT=%s`. Values are never
+truncated.
+
+## 3. The parts of the repository
+
+The repository has five kinds of file: six snapshot scripts, one shared library, one driver, the
+systemd units, and the documents.
+
+| File | What it does | Body |
+|---|---|---|
+| `squeue-snapshot.sh` | Every job in every state, array tasks expanded, every field | records |
+| `scontrol-snapshot.sh` | One `scontrol show` dump: node, partition, reservation, config or job | text or json |
+| `sacctmgr-snapshot.sh` | The associations of this cluster, or every QOS | json |
+| `sprio-snapshot.sh` | The priority factors of every pending job, per partition | records |
+| `sacct-snapshot.sh` | Every job, array task and step that was active in a time window | records |
+| `sshare-snapshot.sh` | Fair-share shares and usage for every account and user | records |
+| `snapshot-lib.sh` | The functions that the scripts share. Sourced, never run | |
+| `snapshot-bundle.sh` | The driver: runs the eleven snapshot calls and writes one bundle | tarball |
+| `systemd/` | Timer and service units for the driver, for root or for an ordinary account | |
+| `snapshot-plans/`, `AGENTS.md`, `CLAUDE.md`, `command-list`, `LICENSE` | The documents | |
+
+Each snapshot script has the same shape. It asks Slurm which fields it knows, builds a format
+from the answer, runs the Slurm command once, and writes the file. The field list is never
+written into a script. Each script writes `OUT_DIR/<name>-<UTC stamp>.txt.gz` as a `.tmp` file
+and then renames it, so the file appears whole or not at all. Each script prints the path of the
+file and exits with the exit status of the Slurm command. Two exit statuses are the script's
+own: 2 for a usage error, and 1 when a discovery step finds nothing.
+
+### 3.1 `squeue-snapshot.sh`
+
+```
+squeue-snapshot.sh OUT_DIR          -> OUT_DIR/squeue-<UTC stamp>.txt.gz
+```
+
+What it captures: every job, in every state, in hidden partitions too, with array tasks
+expanded, and every field that `squeue --helpFormat` lists.
+
+What makes the file safe to read: every field has width `:0`, so no value is truncated. The
+field separator and the record terminator are the control bytes of section 2.2. The header row
+names every column.
+
+Exit status: the status of squeue, 1 if squeue lists no fields, or 2 for a usage error.
+
+Design note: this script is the model that the other scripts copy. The rules are in
+[snapshot-plans/README.md](snapshot-plans/README.md).
+
+### 3.2 `scontrol-snapshot.sh`
+
+```
+scontrol-snapshot.sh OUT_DIR OBJECT  -> OUT_DIR/scontrol-<OBJECT>-<UTC stamp>.txt.gz
+OBJECT: node | partition | reservation | config | job
+```
+
+What it captures: every object of one kind, with every field, hidden partitions included.
+
+What makes the file safe to read: for node, partition, reservation and config the body is the
+output of `scontrol show` in its default multi-line layout. That layout keeps each free-text
+value, for example `OS=` or `Reason=`, on its own line. The one-line layout would join them with
+spaces and make the end of a value a guess. For job the body is JSON. The text form of a job has
+values with spaces and equals signs, and no delimiter can make them unambiguous.
+
+Exit status: the status of scontrol, or 2 for a usage error.
+
+Design notes: [C03 node](snapshot-plans/C03-scontrol-show-node.md),
+[C04 partition](snapshot-plans/C04-scontrol-show-partition.md),
+[C07 job](snapshot-plans/C07-scontrol-show-job.md),
+[C08 reservation](snapshot-plans/C08-scontrol-show-reservation.md),
+[C10 config](snapshot-plans/C10-scontrol-show-config.md).
+
+### 3.3 `sacctmgr-snapshot.sh`
+
+```
+sacctmgr-snapshot.sh OUT_DIR assoc   -> OUT_DIR/sacctmgr-assoc-<UTC stamp>.txt.gz
+sacctmgr-snapshot.sh OUT_DIR qos     -> OUT_DIR/sacctmgr-qos-<UTC stamp>.txt.gz
+```
+
+What it captures: the association tree of this cluster, or every QOS, as one line of JSON.
+
+What makes the file safe to read: sacctmgr has no field list and no delimiter option. JSON is
+the only form that names every field. The assoc query always has the scope `cluster=<name>`.
+The script takes the name from scontrol at run time and checks it against a pattern before it
+uses it. Without a valid name the script writes nothing.
+
+Exit status: the status of sacctmgr, 1 when assoc finds no valid cluster name, or 2 for a usage
+error.
+
+Design notes: [C12 assoc](snapshot-plans/C12-sacctmgr-assoc.md),
+[C13 qos](snapshot-plans/C13-sacctmgr-qos.md).
+
+### 3.4 `sprio-snapshot.sh`
+
+```
+sprio-snapshot.sh OUT_DIR           -> OUT_DIR/sprio-<UTC stamp>.txt.gz
+```
+
+What it captures: the priority factors of every eligible pending job, once per partition. Each
+factor appears in two columns, normalized and weighted, side by side. A `# names:` header line
+gives the column titles that sprio prints.
+
+What makes the file safe to read: every format letter from `sprio --helpformat` is in the
+format, with no width. The script makes no `sprio --weights` call, because that call crashes on
+Slurm 26.05.5. The weights are in the config snapshot instead. If sprio dies from a signal, the
+script tries each letter alone and blanks the bad ones. A `# blanked:` line records them.
+
+Exit status: the status of sprio, 1 if sprio lists no letters, or 2 for a usage error.
+
+Design note: [C14-C16 sprio](snapshot-plans/C14-C16-sprio.md).
+
+### 3.5 `sacct-snapshot.sh`
+
+```
+sacct-snapshot.sh OUT_DIR [SINCE]   -> OUT_DIR/sacct-<UTC stamp>.txt.gz
+```
+
+What it captures: every job, array task and step that was active in a time window, for all
+users of this cluster. The window starts at SINCE and ends at the time of the call. The file has
+every field that `sacct --helpformat` lists. SINCE has the default `now-2hours`. Short forms such as `now-1d` or `now-90m` are permitted. The script
+rewrites them into the whole-word units that sacct accepts.
+
+What makes the file safe to read: sacct has no option to end a record. The script counts the
+field separators on each line and adds the record terminator when a record is complete. Thus a
+submit line with embedded newlines stays in its record. The script rejects a SINCE that it does
+not know, so no unchecked text reaches the command line.
+
+Exit status: the status of sacct, 3 if the output ends inside a record, or 2 for a usage error.
+In the cut-short case the file is still written and has a `# warning:` line.
+
+Design notes: [C11 sacct](snapshot-plans/C11-sacct-array-tasks.md),
+[C17 seff](snapshot-plans/C17-seff.md).
+
+### 3.6 `sshare-snapshot.sh`
+
+```
+sshare-snapshot.sh OUT_DIR          -> OUT_DIR/sshare-<UTC stamp>.txt.gz
+```
+
+What it captures: the configured shares and the decayed usage of every account and user, with
+every field that `sshare --helpformat` lists. The indentation of the account tree is kept.
+
+What makes the file safe to read: the script asks `sshare --help` whether this version has a
+`--delimiter` option. If it has one, the script uses it. If not, the script takes the
+pipe-separated output and translates each pipe into the field separator. Before that, it makes
+sure that every line has the expected number of fields. If a line has more, a value contained a
+pipe, and the script writes nothing.
+
+Exit status: the status of sshare, 3 when a value contained a pipe, or 2 for a usage error.
+
+Design note: [sshare fair share](snapshot-plans/sshare-fairshare.md).
+
+### 3.7 `snapshot-lib.sh`
+
+The snapshot scripts source this library. It defines five functions and nothing else:
+
+- `show_command` prints a command as `# command:` header lines, wrapped so that you can paste it
+  back.
+- `snapshot_stamp` prints the UTC time. Each script reads it once, so the header and the file
+  name agree.
+- `cluster_name` prints the cluster name from `scontrol show config`, or nothing.
+- `join_fields` joins field names into a format string or a header row.
+- `write_snapshot` writes the header lines and the body, gzipped, as a `.tmp` file, then renames
+  it.
+
+### 3.8 `snapshot-bundle.sh`
+
+```
+snapshot-bundle.sh ROOT_DIR [SINCE]  -> ROOT_DIR/YYYY/MM/DD/<cluster>-<UTC stamp>.tgz
+```
+
+The driver runs one cycle. It reads the clock once and asks scontrol for the cluster name. From
+these it builds the bundle name and the day directory of section 2. Then it runs the eleven
+snapshot calls, one after another, into that directory. Then it writes the directory as a
+tarball, compressed with gzip, as a `.tmp` file and renames it. Last, it removes the directory.
+
+A step that fails does not stop the cycle. The other files still have value, and each file has
+its own `# exit:` line. The manifest records what happened:
+
+```
+# bundle: eofe7-20261121T141500Z
+# started: 2026-11-21T14:15:00Z
+# host: login006
+# cluster: eofe7
+# command:
+#   snapshot-bundle.sh /var/lib/slurm-snapshot now-2hours
+# steps: 11
+# columns: step	exit	seconds	file
+squeue-snapshot.sh	0	3	squeue-20261121T141500Z.txt.gz
+scontrol-snapshot.sh job	0	1	scontrol-job-20261121T141503Z.txt.gz
+...
+sacct-snapshot.sh now-2hours	0	9	sacct-20261121T141530Z.txt.gz
+# finished: 2026-11-21T14:15:39Z
+# failed: 0
+# exit: 0
+```
+
+The exit status of the driver says what is on disk:
+
+| Exit status | Meaning | What is on disk |
+|---|---|---|
+| 0 | Every step and the tar succeeded | The tarball |
+| 1 | The tarball was written, but one or more steps failed | The tarball, with `# failed:` in the manifest |
+| 3 | tar or gzip failed | The directory with its files, no tarball |
+| 2 | Usage error | Nothing |
+
+Design note: [bundle driver](snapshot-plans/bundle-driver.md).
+
+### 3.9 `systemd/`
+
+Two pairs of units run the same driver every 15 minutes. The pair in `systemd/system/` is for a
+site where root installs a service and a dedicated account runs it. The pair in `systemd/user/`
+is for an ordinary account that has no root access. Section 5 gives the steps for each.
+
+### 3.10 The documents
+
+- `snapshot-plans/` holds the design notes, one per Slurm command and one for the driver. Its
+  `README.md` gives the rules, the file layout and the test results.
+- `AGENTS.md` holds the instructions for anyone who changes this repository: scope, the file
+  contract, the design rules, the known traps, and the tests.
+- `CLAUDE.md` points an AI agent at `AGENTS.md`.
+- `command-list` is the sequence of the eleven snapshot calls, as a person runs them by hand.
+  The driver replaces it.
+- `LICENSE` is the MIT License.
+
+## 4. Run a snapshot by hand
+
+You can run any script by hand before you install a timer:
+
+1. Copy this directory to a login node.
+2. Run one script with an output directory as its argument:
+
+   ```bash
+   ./squeue-snapshot.sh /tmp/snap-test
+   ```
+
+3. Look at the file that the script printed:
+
+   ```bash
+   gzip -dc /tmp/snap-test/squeue-*.txt.gz | head -12
+   ```
+
+To run one full cycle, give the driver a work root:
+
+```bash
+./snapshot-bundle.sh /tmp/snap-test
+find /tmp/snap-test -type f
+```
+
+The second command lists one tarball under a date path.
+
+## 5. Run on a timer with systemd
+
+Two sets of units run the same driver. The driver finds the snapshot scripts and the library
+next to itself, so copy the whole directory. Before you install either set, make sure that the
+account has permission to read every job and association. The Slurm setting `PrivateData` can
+hide them.
+
+### 5.1 As a system service
+
+Root installs the units. A dedicated account runs the driver.
+
+1. Copy this directory to the login node, for example to `/opt/slurm-snapshot/`.
+2. Create the work root, for example `/var/lib/slurm-snapshot`.
+3. Create a service account that can run the Slurm client commands and write to the work root.
+4. In `systemd/system/slurm-snapshot.service`, edit `User=` and the two paths in `ExecStart=`.
+5. Copy the two units from `systemd/system/` to `/etc/systemd/system/`.
+6. Enable the timer and do one check:
 
    ```bash
    systemctl daemon-reload
    systemctl enable --now slurm-snapshot.timer
    systemctl list-timers slurm-snapshot.timer
-   systemctl start slurm-snapshot.service      # one cycle now, to check
-   journalctl -u slurm-snapshot                # a failing step's stderr lands here
+   systemctl start slurm-snapshot.service      # one cycle now
+   journalctl -u slurm-snapshot                # the output of a failed step is here
    ```
 
-**As an ordinary user (no root):** the units in `systemd/user/` run under the account's own
-systemd manager (`systemctl --user`). They have no `User=` line and no sandboxing. Where the
-scripts and the work root live is a parameter: the service reads `SNAPSHOT_SCRIPTS`,
-`SNAPSHOT_ROOT` and `SNAPSHOT_SINCE` from `~/.config/systemd/user/slurm-snapshot.env`
-(`slurm-snapshot.env.example` is the template). Without that file it falls back to
-`~/slurm-snapshot`, `~/slurm-snapshot-data` and `now-2hours`. Write absolute paths in the file:
-systemd expands no `~`, `$HOME` or other variables there.
+### 5.2 As an ordinary user
 
-```bash
-SCRIPTS=/path/of/your/choice/slurm-snapshot          # where the scripts will live
-ROOT=/scratch/$USER/slurm-snapshot-data              # the work root for the bundles
-cp -r scripts "$SCRIPTS"
-mkdir -p "$ROOT" ~/.config/systemd/user
-cp "$SCRIPTS"/systemd/user/slurm-snapshot.{service,timer} ~/.config/systemd/user/
-printf 'SNAPSHOT_SCRIPTS=%s\nSNAPSHOT_ROOT=%s\nSNAPSHOT_SINCE=now-2hours\n' "$SCRIPTS" "$ROOT" \
-  > ~/.config/systemd/user/slurm-snapshot.env
-systemctl --user daemon-reload
-systemctl --user show -p Environment slurm-snapshot.service   # the values in effect
-systemctl --user enable --now slurm-snapshot.timer
-systemctl --user list-timers slurm-snapshot.timer
-systemctl --user start slurm-snapshot.service        # one cycle now, to check
-journalctl --user -u slurm-snapshot
-loginctl enable-linger                               # see below
-```
+The units in `systemd/user/` run under the systemd manager of your own account. You install
+them with `systemctl --user`. They have no `User=` line and no sandbox. The paths are
+parameters. The service reads them from `~/.config/systemd/user/slurm-snapshot.env`:
 
-To move the work root later, edit the env file and run `systemctl --user daemon-reload`; the
-next cycle uses the new path.
+| Variable | Meaning | Default when the file is absent |
+|---|---|---|
+| `SNAPSHOT_SCRIPTS` | The copy of this directory | `~/slurm-snapshot` |
+| `SNAPSHOT_ROOT` | The work root for the bundles | `~/slurm-snapshot-data` |
+| `SNAPSHOT_SINCE` | The sacct window | `now-2hours` |
 
-The user manager, and with it the timer, normally stops when the account's last session ends.
-`loginctl enable-linger` keeps it running; the default policy lets an account enable linger
-for itself, but a site may restrict it, in which case ask the administrator to run
-`loginctl enable-linger USER`. If `systemctl --user` answers "Failed to connect to bus", the
-login node runs no user manager (no `pam_systemd`); then the system units are the way, or as a
-last resort a crontab line, which must take its own lock since cron does not stop overlapping
-runs:
+Write absolute paths in that file. systemd does not expand `~`, `$HOME` or other variables
+there. The file `systemd/user/slurm-snapshot.env.example` is a template.
+
+1. Choose the two paths and copy the directory:
+
+   ```bash
+   SCRIPTS=/path/of/your/choice/slurm-snapshot
+   ROOT=/scratch/$USER/slurm-snapshot-data
+   cp -r scripts "$SCRIPTS"
+   mkdir -p "$ROOT" ~/.config/systemd/user
+   ```
+
+2. Install the units and write the parameter file:
+
+   ```bash
+   cp "$SCRIPTS"/systemd/user/slurm-snapshot.{service,timer} ~/.config/systemd/user/
+   printf 'SNAPSHOT_SCRIPTS=%s\nSNAPSHOT_ROOT=%s\nSNAPSHOT_SINCE=now-2hours\n' "$SCRIPTS" "$ROOT" \
+     > ~/.config/systemd/user/slurm-snapshot.env
+   ```
+
+3. Enable the timer and do one check:
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user show -p Environment slurm-snapshot.service   # the values in effect
+   systemctl --user enable --now slurm-snapshot.timer
+   systemctl --user list-timers slurm-snapshot.timer
+   systemctl --user start slurm-snapshot.service        # one cycle now
+   journalctl --user -u slurm-snapshot
+   ```
+
+4. Keep the timer alive after you log out:
+
+   ```bash
+   loginctl enable-linger
+   ```
+
+The user manager normally stops when your last session ends, and the timer stops with it.
+Linger keeps the manager alive. The default policy lets an account enable linger for itself. If
+your site does not permit this, ask the administrator to run `loginctl enable-linger USER`.
+
+To move the work root later, edit the parameter file and run `systemctl --user daemon-reload`.
+The next cycle uses the new path.
+
+If `systemctl --user` answers "Failed to connect to bus", the login node runs no user manager.
+Then the system units of section 5.1 are the way. As a last resort, a crontab line can run the
+driver. Cron starts a second run while the first still runs, so the line must take a lock:
 
 ```
 */15 * * * * flock -n ROOT/.lock SCRIPTS/snapshot-bundle.sh ROOT now-2hours >/dev/null
 ```
 
-with `ROOT` and `SCRIPTS` written out as the same absolute paths as in the env file.
+Write `ROOT` and `SCRIPTS` as the same absolute paths as in the parameter file.
 
-Each cycle leaves one `ROOT/YYYY/MM/DD/<cluster>-<stamp>.tgz`. `TimeoutStartSec=` bounds the
-cycle: keep it well above 2 minutes (scontrol retries for 60 s per call when Slurm is broken) and
-below the interval; tune it from the `seconds` column of the manifests. systemd never starts
-the oneshot while the previous cycle still runs. Removing old tarballs is not the driver's job;
-use a `tmpfiles.d` age rule or a separate `find -mtime` timer.
+### 5.3 What to expect in operation
 
-## What a reviewer checks
+Each cycle leaves one tarball under the date path. systemd does not start a cycle while the
+previous cycle still runs, so cycles never overlap. The setting `TimeoutStartSec=` is the only
+time limit on a cycle. Keep it above 2 minutes, because scontrol retries for 60 seconds per call
+when Slurm is down. Keep it below the timer interval. The `seconds` column of the manifests shows
+how long each step takes.
 
-For `snapshot-bundle.sh`:
-- every step's argv is a literal (no step list read from a file, no `eval`);
-- a failing step is recorded in the manifest and the cycle goes on;
-- the tarball is written as `.tmp` and renamed, and the directory is removed only after that.
+The driver does not remove old tarballs. A `tmpfiles.d` age rule or a separate `find -mtime`
+timer can do that.
 
-For the `*-snapshot.sh` scripts:
-- one bulk Slurm call per file (sprio may add the probes of its crash fallback);
-- fields come from the command at run time where it can list them (`--helpFormat` /
-  `--helpformat`), never from a pasted list;
-- every dynamic value is validated before it reaches an argv;
-- `set -euo pipefail` comes straight after the header comment;
-- the common header goes through `write_snapshot`.
+## 6. Check that a bundle is complete
 
-The fake-slurm shims cannot replay their argvs, so run them in the Docker test cluster
-(`snapshot-plans/README.md`, "Test cluster").
+Three checks tell you that a bundle is complete. Replace NAME with the base name of the tarball,
+without `.tgz`.
 
-## Keeping this README current
+1. The tarball is under the date path and holds twelve members:
 
-Update this file when a `*-snapshot.sh` script changes its usage, its argv, its file layout or
-its exit statuses, and update the matching `snapshot-plans/` doc in the same change.
+   ```bash
+   tar -tzf ROOT/2026/11/21/NAME.tgz
+   ```
 
-## License
+2. The manifest shows exit status 0 for every step and `# failed: 0` at the end:
 
-MIT; see [LICENSE](LICENSE). This repository, `slurmsnap-capture`, is the first of the
-`slurmsnap-*` family: it captures the raw snapshot bundles that `slurmsnap-ingest` turns into a
-DuckDB store and that the analysis and presentation code reads from there.
+   ```bash
+   tar -xzOf ROOT/2026/11/21/NAME.tgz NAME/manifest.txt
+   ```
+
+3. Each snapshot file has `# exit: 0` in its header:
+
+   ```bash
+   for m in $(tar -tzf ROOT/2026/11/21/NAME.tgz | grep 'txt.gz$'); do
+     printf '%s %s\n' "$m" "$(tar -xzOf ROOT/2026/11/21/NAME.tgz "$m" | gzip -dc | grep -m1 '^# exit:')"
+   done
+   ```
+
+## 7. Where the design reasoning is
+
+Every design decision has a document. [snapshot-plans/README.md](snapshot-plans/README.md)
+holds the rules that every script obeys, the file layout, and the parse rule for text bodies.
+It also holds the cadence table and the facts that were checked on a test cluster. One note per
+Slurm command
+says why the script has its argument list, its body kind and its flags. The note
+[bundle-driver.md](snapshot-plans/bundle-driver.md) does the same for the driver.
+
+The scripts were tested on a local Docker Slurm cluster, version 26.05.5, and against one bundle
+from a production cluster with about 39,000 sacct records. `AGENTS.md` describes the test
+cluster and the test procedure.
+
+## 8. For contributors
+
+The rules for changes to this repository are in [AGENTS.md](AGENTS.md). That file gives the
+scope, the file contract, the design rules, the known traps, the tests, and the checks that a
+reviewer does. Every `*.sh` file passes `shellcheck`.
+
+## 9. Related repositories
+
+This repository is the first of the `slurmsnap-*` family:
+
+| Repository | What it does |
+|---|---|
+| `slurmsnap-capture` | Captures the raw snapshot bundles. This repository. |
+| `slurmsnap-ingest` | Regularizes the bundles and loads them into a DuckDB store. |
+| The analysis repository | Analyzes and presents the information in the store. |
+
+## 10. License
+
+MIT. Refer to [LICENSE](LICENSE).

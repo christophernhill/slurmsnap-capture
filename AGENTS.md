@@ -57,7 +57,7 @@ Consequences:
 | `systemd/` | Example `slurm-snapshot.service` (oneshot) and `slurm-snapshot.timer` (`OnCalendar=*:0/15`) for the driver: `system/` for a root-installed service account, `user/` for an ordinary account's `systemctl --user` |
 | `snapshot-lib.sh` | Sourced, never run. `show_command`, `snapshot_stamp`, `cluster_name`, `join_fields`, `write_snapshot` |
 | `snapshot-plans/` | Design notes: one doc per command step, plus `README.md` (rules, file layout, cadence, test cluster, open items). **The reference for design decisions** |
-| `README.md` | Per-file reference for the scripts, checks and reviewer notes |
+| `README.md` | The reader's guide: what the repository is, what a bundle contains, each file, how to run by hand and under systemd. Written in Simplified Technical English (ASD-STE100) as far as the subject permits |
 | `command-list` | The user's own list of commands for one bundle run. Don't edit it unless asked |
 
 The legacy `capture-raw.sh` (the old per-job capture, which the `snapshot-plans/` docs compare
@@ -174,8 +174,10 @@ Every script writes `OUT_DIR/<name>-<UTC stamp>.txt.gz`, e.g.
    - `write_snapshot …`, then `exit "$status"`.
 3. **Record new facts with their evidence:** mark a fact `VERIFIED docker` only after checking it
    in the test cluster, and `TO VERIFY` until then.
-4. **Update the docs:** `README.md` (the file table) and `snapshot-plans/README.md` (index,
-   hardcoded list, verified facts, still-to-verify).
+4. **Update the docs:** `README.md` (the parts table and the script's subsection) and
+   `snapshot-plans/README.md` (index, hardcoded list, verified facts, still-to-verify). Update
+   `README.md` whenever a script changes its usage, its argv, its file layout or its exit
+   statuses, and update the matching `snapshot-plans/` doc in the same change.
 
 ### Known traps (each one has already bitten here)
 
@@ -219,6 +221,16 @@ docker cp slurmctld:/tmp/out ./docker-out
 docker exec slurmctld rm -rf /tmp/snap /tmp/out          # clean up afterwards
 ```
 
+To test the driver, run it the same way and look inside the result. The only file left under
+`/tmp/out` must be `YYYY/MM/DD/linux-<stamp>.tgz`:
+
+```bash
+docker exec slurmctld /tmp/snap/snapshot-bundle.sh /tmp/out
+docker exec slurmctld find /tmp/out -type f
+tar -tzf docker-out/2026/11/21/linux-<stamp>.tgz
+tar -xzOf docker-out/2026/11/21/linux-<stamp>.tgz linux-<stamp>/manifest.txt
+```
+
 - **One-off queries:** `docker exec [-e SLURM_TIME_FORMAT=%s] slurmctld <command>`. The container
   has no `diff`: copy files out to compare them.
 - **Failure paths:** put a small stub executable first on `PATH` inside the container, e.g. a
@@ -253,6 +265,23 @@ shows; 12 in the file as captured before the 2026-11-13 fix).
 **Real clusters:** e.g. orcd-login, Slurm 26.05.4. These are production systems. **Do not connect
 to them or run anything there yourself.** The user runs the scripts there and reports back. Items
 that can only be checked there are listed under "Still to verify" in `snapshot-plans/README.md`.
+
+### What a reviewer checks
+
+For `snapshot-bundle.sh`:
+- every step's argv is a literal (no step list read from a file, no `eval`);
+- a failing step is recorded in the manifest and the cycle goes on;
+- the tarball is written as `.tmp` and renamed, and the directory is removed only after that.
+
+For the `*-snapshot.sh` scripts:
+- one bulk Slurm call per file (sprio may add the probes of its crash fallback);
+- fields come from the command at run time where it can list them (`--helpFormat` /
+  `--helpformat`), never from a pasted list;
+- every dynamic value is validated before it reaches an argv;
+- `set -euo pipefail` comes straight after the header comment;
+- the common header goes through `write_snapshot`.
+
+The fake-slurm shims cannot replay these argvs, so run the scripts in the Docker test cluster.
 
 ## 8. Where to look for more
 
