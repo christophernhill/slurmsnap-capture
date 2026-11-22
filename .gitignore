@@ -1,0 +1,6 @@
+# Test output copied back from the Docker cluster (AGENTS.md section 7)
+docker-out/
+# Half-written snapshot or bundle files
+*.tmp
+# macOS
+.DS_Store
