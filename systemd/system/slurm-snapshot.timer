@@ -1,0 +1,17 @@
+# slurm-snapshot.timer (system unit): fire slurm-snapshot.service every 15 minutes, on the
+# quarter hour. The user-account variant is in ../user/.
+#
+# A snapshot is a point in time, so a cycle missed while the node was down is not run late
+# (Persistent=no). systemd does not start the oneshot while the previous cycle still runs, so
+# cycles never overlap; a cycle longer than the interval simply skips the next tick.
+[Unit]
+Description=Slurm snapshot bundle every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+AccuracySec=1s
+Persistent=no
+Unit=slurm-snapshot.service
+
+[Install]
+WantedBy=timers.target

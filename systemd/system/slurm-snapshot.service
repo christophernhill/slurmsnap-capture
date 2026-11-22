@@ -1,0 +1,32 @@
+# slurm-snapshot.service (system unit): one snapshot cycle (snapshot-bundle.sh) as a dedicated
+# service account, started by slurm-snapshot.timer. Needs root to install. For an ordinary
+# account without root, use the units in ../user/ instead.
+#
+# Install: copy the scripts directory to /opt/slurm-snapshot, create the output root and the
+# user, copy this file and the timer to /etc/systemd/system/, then
+#   systemctl daemon-reload && systemctl enable --now slurm-snapshot.timer
+# Watch: systemctl list-timers slurm-snapshot.timer ; journalctl -u slurm-snapshot
+#
+# Edit User= and the two paths in ExecStart= for the site. The optional SINCE (here now-2hours)
+# is the sacct window; it should overlap the timer interval.
+[Unit]
+Description=Slurm snapshot bundle: one cycle of the *-snapshot.sh scripts
+Documentation=file:///opt/slurm-snapshot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=slurmsnap
+ExecStart=/opt/slurm-snapshot/snapshot-bundle.sh /var/lib/slurm-snapshot now-2hours
+# A cycle is bounded here, not by timeout(1) inside the scripts. With a broken Slurm
+# configuration scontrol retries for up to 60 s per call, so allow well over 2 minutes; keep it
+# under the timer interval. Tune against the seconds column of the bundle's manifest.txt.
+TimeoutStartSec=14min
+Nice=10
+IOSchedulingClass=idle
+# The scripts write only under the output root (and mktemp files under /tmp).
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/slurm-snapshot
