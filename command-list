@@ -1,0 +1,13 @@
+ODIR=sq-20261113-test001
+./squeue-snapshot.sh    ${ODIR}
+./scontrol-snapshot.sh  ${ODIR} job
+./sprio-snapshot.sh     ${ODIR}
+./sshare-snapshot.sh    ${ODIR}
+./scontrol-snapshot.sh  ${ODIR} node
+./scontrol-snapshot.sh  ${ODIR} partition
+./scontrol-snapshot.sh  ${ODIR} reservation
+./scontrol-snapshot.sh  ${ODIR} config
+./sacctmgr-snapshot.sh  ${ODIR} assoc
+./sacctmgr-snapshot.sh  ${ODIR} qos
+./sacct-snapshot.sh     ${ODIR} now-1hours
+
