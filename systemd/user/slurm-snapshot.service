@@ -19,7 +19,10 @@
 #   systemctl --user daemon-reload && systemctl --user enable --now slurm-snapshot.timer
 #   loginctl enable-linger            # keep the user manager, so the timer, alive after logout
 # Watch: systemctl --user list-timers slurm-snapshot.timer ; journalctl --user -u slurm-snapshot
-#        systemctl --user show -p Environment slurm-snapshot.service    # the values in effect
+#        systemctl --user show -p EnvironmentFiles slurm-snapshot.service   # the file is known
+# The "Environment" property shows only the defaults below: systemd reads the env file when it
+# starts the service, not when it loads the unit. The proof that the file is in effect is the
+# tarball path in the journal, which must start with SNAPSHOT_ROOT.
 #
 # There is no User= line: a user unit always runs as its owner. The sandboxing lines of the
 # system unit (ProtectSystem=, PrivateTmp=) are left out: they need namespaces an unprivileged

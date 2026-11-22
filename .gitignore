@@ -4,3 +4,5 @@ docker-out/
 *.tmp
 # macOS
 .DS_Store
+# A work root placed inside the checkout (SNAPSHOT_ROOT in the user unit, or a hand run)
+slurm-snapshot-data/

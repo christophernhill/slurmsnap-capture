@@ -404,12 +404,17 @@ there. The file `systemd/user/slurm-snapshot.env.example` is a template.
 
    ```bash
    systemctl --user daemon-reload
-   systemctl --user show -p Environment slurm-snapshot.service   # the values in effect
+   systemctl --user show -p EnvironmentFiles slurm-snapshot.service   # the file is known
    systemctl --user enable --now slurm-snapshot.timer
    systemctl --user list-timers slurm-snapshot.timer
    systemctl --user start slurm-snapshot.service        # one cycle now
-   journalctl --user -u slurm-snapshot
+   journalctl --user -u slurm-snapshot -n 5             # the last line is the tarball path
    ```
+
+   The tarball path must start with your `SNAPSHOT_ROOT`. That is the proof that the parameter
+   file is in effect. The property `Environment` shows only the defaults from the unit file,
+   because systemd reads the parameter file when it starts the service, not when it loads the
+   unit.
 
 4. Keep the timer alive after you log out:
 
