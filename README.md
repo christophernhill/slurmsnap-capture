@@ -137,3 +137,9 @@ The fake-slurm shims cannot replay their argvs, so run them in the Docker test c
 
 Update this file when a `*-snapshot.sh` script changes its usage, its argv, its file layout or
 its exit statuses, and update the matching `snapshot-plans/` doc in the same change.
+
+## License
+
+MIT; see [LICENSE](LICENSE). This repository, `slurmsnap-capture`, is the first of the
+`slurmsnap-*` family: it captures the raw snapshot bundles that `slurmsnap-ingest` turns into a
+DuckDB store and that the analysis and presentation code reads from there.
